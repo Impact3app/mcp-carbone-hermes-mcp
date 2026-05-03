@@ -42,7 +42,7 @@ const EXTRA_DATASET_PATTERNS = [
 
 const server = new McpServer({
   name: "mcp-carbone-hermes",
-  version: "5.1.0"
+  version: "5.1.1"
 });
 
 function normalize(text = "") {
@@ -371,12 +371,12 @@ function safeReadWorkbook(filePath, options = {}) {
 function loadBaseCarboneRecords(filePath) {
   if (!filePath || !fs.existsSync(filePath)) return [];
 
-  const workbook = XLSX.readFile(filePath, {
-    raw: false,
-    dense: true,
+  const workbook = safeReadWorkbook(filePath, {
     FS: ";",
     codepage: 1252
   });
+
+  if (!workbook) return [];
 
   const sheetName = workbook.SheetNames[0];
   const sheet = workbook.Sheets[sheetName];
@@ -578,12 +578,12 @@ function loadGenericExtraRecords(filePath) {
   const records = [];
 
   if (ext === ".csv") {
-    const workbook = XLSX.readFile(filePath, {
-      raw: false,
-      dense: true,
+    const workbook = safeReadWorkbook(filePath, {
       FS: ";",
       codepage: 1252
     });
+
+    if (!workbook) return [];
 
     const sheet = workbook.Sheets[workbook.SheetNames[0]];
     const rows = XLSX.utils.sheet_to_json(sheet, { defval: "" });
@@ -1365,9 +1365,12 @@ server.tool(
       followupQuestion: "Peux-tu préciser le produit alimentaire exact ?"
     });
 
-    const selected = found.selected?.dataset === "agribalyse_products" || found.selected?.dataset === "agribalyse_agriculture"
-      ? found.selected
-      : found.candidates.find((item) => item.dataset === "agribalyse_products" || item.dataset === "agribalyse_agriculture") || null;
+    const selected =
+      found.selected?.dataset === "agribalyse_products" || found.selected?.dataset === "agribalyse_agriculture"
+        ? found.selected
+        : found.candidates.find(
+            (item) => item.dataset === "agribalyse_products" || item.dataset === "agribalyse_agriculture"
+          ) || null;
 
     if (!selected) {
       return mcpText({
@@ -1487,7 +1490,7 @@ server.tool(
 );
 
 app.get("/", (req, res) => {
-  res.send("MCP Carbone Hermes OK — v5.1.0");
+  res.send("MCP Carbone Hermes OK — v5.1.1");
 });
 
 app.get("/health", async (req, res) => {
@@ -1496,7 +1499,7 @@ app.get("/health", async (req, res) => {
   res.json({
     status: "OK",
     service: "mcp-carbone-hermes",
-    version: "5.1.0",
+    version: "5.1.1",
     dataset: DATASET,
     files: {
       base_carbone_file: LOCAL_DATASETS.files.baseCarboneFile ? path.basename(LOCAL_DATASETS.files.baseCarboneFile) : null,
@@ -1523,7 +1526,12 @@ app.get("/reload-data", (req, res) => {
   LOCAL_DATASETS = loadLocalDatasets();
   res.json({
     status: "OK",
-    files: LOCAL_DATASETS.files,
+    files: {
+      base_carbone_file: LOCAL_DATASETS.files.baseCarboneFile,
+      agribalyse_products_file: LOCAL_DATASETS.files.agribalyseProductsFile,
+      agribalyse_agri_file: LOCAL_DATASETS.files.agribalyseAgriFile,
+      extra_files: LOCAL_DATASETS.files.extraFiles
+    },
     local_datasets: {
       base_carbone: LOCAL_DATASETS.baseCarbone.length,
       agribalyse_products: LOCAL_DATASETS.agribalyseProducts.length,
@@ -1569,7 +1577,7 @@ app.post("/mcp", async (req, res) => {
 });
 
 app.listen(PORT, () => {
-  console.log(`MCP Carbone Hermes v5.1.0 running on port ${PORT}`);
+  console.log(`MCP Carbone Hermes v5.1.1 running on port ${PORT}`);
   console.log("Loaded files:", {
     baseCarboneFile: LOCAL_DATASETS.files.baseCarboneFile,
     agribalyseProductsFile: LOCAL_DATASETS.files.agribalyseProductsFile,
