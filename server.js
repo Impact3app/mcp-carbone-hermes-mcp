@@ -12,26 +12,37 @@ const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 
 const app = express();
-app.use(express.json({ limit: "4mb" }));
+app.use(express.json({ limit: "6mb" }));
 
 const PORT = Number(process.env.PORT || 3000);
 const BASE_URL = process.env.ADEME_BASE_URL || "https://data.ademe.fr/api/records/1.0/search/";
 const DATASET = process.env.ADEME_DATASET || "base-carboner";
-
 const DATA_DIR = path.join(__dirname, "data");
-const BASE_CARBONE_FILE = path.join(DATA_DIR, "Base_Carbone_V23.6.csv");
-const AGRIBALYSE_PRODUCTS_FILE = path.join(
-  DATA_DIR,
+
+const BASE_CARBONE_CANDIDATES = [
+  "Base_Carbone_V23.9.csv",
+  "Base_Carbone_V23.6.csv"
+];
+
+const AGRIBALYSE_PRODUCTS_CANDIDATES = [
+  "AGRIBALYSE3.2_Tableur produits alimentaires_PublieAOUT25.xlsx",
   "AGRIBALYSE3.2_Tableur-produits-alimentaires_PublieAOUT25.xlsx"
-);
-const AGRIBALYSE_AGRI_FILE = path.join(
-  DATA_DIR,
+];
+
+const AGRIBALYSE_AGRI_CANDIDATES = [
+  "AGRIBALYSE3.2_partie agriculture_conv_PublieNOV25.xlsx",
   "AGRIBALYSE3.2_partie-agriculture_conv_PublieNOV25.xlsx"
-);
+];
+
+const EXTRA_DATASET_PATTERNS = [
+  /^BI_3\.0_/i,
+  /^Tableau-de-suivi/i,
+  /^donnees-aet-base-empreinte/i
+];
 
 const server = new McpServer({
   name: "mcp-carbone-hermes",
-  version: "5.0.0"
+  version: "5.1.0"
 });
 
 function normalize(text = "") {
@@ -71,6 +82,22 @@ function unique(values) {
 
 function makeSearchText(parts) {
   return normalize(parts.filter(Boolean).join(" "));
+}
+
+function resolveFirstExistingFile(dir, candidates) {
+  for (const name of candidates) {
+    const fullPath = path.join(dir, name);
+    if (fs.existsSync(fullPath)) return fullPath;
+  }
+  return null;
+}
+
+function listExtraDatasetFiles(dir) {
+  if (!fs.existsSync(dir)) return [];
+  return fs
+    .readdirSync(dir)
+    .filter((name) => EXTRA_DATASET_PATTERNS.some((pattern) => pattern.test(name)))
+    .map((name) => path.join(dir, name));
 }
 
 const MATERIAL_TAXONOMY = [
@@ -291,7 +318,6 @@ function scoreTextMatch(searchText = "", query = "") {
   const words = q.split(" ").filter((word) => word.length > 2);
 
   if (searchText.includes(q)) score += 50;
-
   for (const word of words) {
     if (searchText.includes(word)) score += 12;
   }
@@ -329,7 +355,7 @@ function rowsToObjects(rows, headerIndex) {
 }
 
 function safeReadWorkbook(filePath, options = {}) {
-  if (!fs.existsSync(filePath)) return null;
+  if (!filePath || !fs.existsSync(filePath)) return null;
   return XLSX.readFile(filePath, {
     raw: false,
     cellDates: false,
@@ -338,13 +364,15 @@ function safeReadWorkbook(filePath, options = {}) {
   });
 }
 
-function loadBaseCarboneRecords() {
-  const workbook = safeReadWorkbook(BASE_CARBONE_FILE, {
+function loadBaseCarboneRecords(filePath) {
+  if (!filePath || !fs.existsSync(filePath)) return [];
+
+  const workbook = XLSX.readFile(filePath, {
+    raw: false,
+    dense: true,
     FS: ";",
     codepage: 1252
   });
-
-  if (!workbook) return [];
 
   const sheetName = workbook.SheetNames[0];
   const sheet = workbook.Sheets[sheetName];
@@ -363,13 +391,12 @@ function loadBaseCarboneRecords() {
       return item;
     })
     .map((row) => {
-      const factor =
-        firstDefined(
-          toNumber(row["CO2f"]),
-          toNumber(row["Total poste non décomposé"]),
-          toNumber(row["Total poste decompose"]),
-          toNumber(row["Valeur"])
-        );
+      const factor = firstDefined(
+        toNumber(row["CO2f"]),
+        toNumber(row["Total poste non décomposé"]),
+        toNumber(row["Total poste decompose"]),
+        toNumber(row["Valeur"])
+      );
 
       const name = firstDefined(row["Nom base français"], row["Nom attribut français"]);
       const category = firstDefined(row["Code de la catégorie"], row["Type poste"], row["Nom poste français"]);
@@ -378,12 +405,13 @@ function loadBaseCarboneRecords() {
       const source = firstDefined(row["Programme"], row["Source"], "Base Carbone");
       const status = row["Statut de l'élément"];
 
-      if (!name || !factor || !unit) return null;
+      if (!name || factor === null || !unit) return null;
 
       return {
         id: row["Identifiant de l'élément"] || `bc-${normalize(name)}-${factor}`,
         dataset: "base_carbone",
         origin: "local_official_dataset",
+        source_file: path.basename(filePath),
         name,
         factor,
         unit,
@@ -397,8 +425,8 @@ function loadBaseCarboneRecords() {
     .filter(Boolean);
 }
 
-function loadAgribalyseProductsRecords() {
-  const workbook = safeReadWorkbook(AGRIBALYSE_PRODUCTS_FILE);
+function loadAgribalyseProductsRecords(filePath) {
+  const workbook = safeReadWorkbook(filePath);
   if (!workbook) return [];
 
   const sheet = workbook.Sheets["Synthese"];
@@ -427,6 +455,7 @@ function loadAgribalyseProductsRecords() {
         id: code || `agb-prod-${normalize(name)}`,
         dataset: "agribalyse_products",
         origin: "local_official_dataset",
+        source_file: path.basename(filePath),
         name,
         factor,
         unit: "kgCO2e/kg de produit",
@@ -440,8 +469,8 @@ function loadAgribalyseProductsRecords() {
     .filter(Boolean);
 }
 
-function loadAgribalyseAgricultureRecords() {
-  const workbook = safeReadWorkbook(AGRIBALYSE_AGRI_FILE);
+function loadAgribalyseAgricultureRecords(filePath) {
+  const workbook = safeReadWorkbook(filePath);
   if (!workbook) return [];
 
   const sheet = workbook.Sheets["AGB 3.2 agricole conventionnel"];
@@ -469,6 +498,7 @@ function loadAgribalyseAgricultureRecords() {
         id: `agb-agri-${normalize(name)}`,
         dataset: "agribalyse_agriculture",
         origin: "local_official_dataset",
+        source_file: path.basename(filePath),
         name,
         factor,
         unit: "kgCO2e/kg",
@@ -482,16 +512,167 @@ function loadAgribalyseAgricultureRecords() {
     .filter(Boolean);
 }
 
+function chooseLikelyName(row) {
+  const entries = Object.entries(row);
+  const preferred = [
+    "nom",
+    "name",
+    "libelle",
+    "label",
+    "produit",
+    "poste",
+    "categorie",
+    "category",
+    "designation"
+  ];
+
+  for (const key of preferred) {
+    const found = entries.find(([k, v]) => normalize(k).includes(key) && v);
+    if (found) return String(found[1]);
+  }
+
+  const firstText = entries.find(([_, v]) => typeof v === "string" && normalize(v).length > 3);
+  return firstText ? String(firstText[1]) : null;
+}
+
+function chooseLikelyUnit(row) {
+  const entries = Object.entries(row);
+  const unitKey = entries.find(([k]) => normalize(k).includes("unite") || normalize(k).includes("unit"));
+  if (unitKey && unitKey[1]) return String(unitKey[1]);
+
+  const values = entries.map(([, v]) => normalize(v));
+  const candidate = values.find((v) => v.includes("kg co2") || v.includes("t.km") || v.includes("kwh"));
+  return candidate || null;
+}
+
+function chooseLikelyFactor(row) {
+  const entries = Object.entries(row);
+
+  const preferredKeys = [
+    "co2",
+    "changement climatique",
+    "total",
+    "impact",
+    "valeur"
+  ];
+
+  for (const hint of preferredKeys) {
+    const found = entries.find(([k, v]) => normalize(k).includes(hint) && toNumber(v) !== null);
+    if (found) return toNumber(found[1]);
+  }
+
+  for (const [, value] of entries) {
+    const n = toNumber(value);
+    if (n !== null && Math.abs(n) < 1000000) return n;
+  }
+
+  return null;
+}
+
+function loadGenericExtraRecords(filePath) {
+  const ext = path.extname(filePath).toLowerCase();
+  const records = [];
+
+  if (ext === ".csv") {
+    const workbook = XLSX.readFile(filePath, {
+      raw: false,
+      dense: true,
+      FS: ";",
+      codepage: 1252
+    });
+
+    const sheet = workbook.Sheets[workbook.SheetNames[0]];
+    const rows = XLSX.utils.sheet_to_json(sheet, { defval: "" });
+
+    rows.forEach((row, index) => {
+      const name = chooseLikelyName(row);
+      const factor = chooseLikelyFactor(row);
+      const unit = chooseLikelyUnit(row);
+
+      if (!name || factor === null) return;
+
+      records.push({
+        id: `extra-${path.basename(filePath)}-${index}`,
+        dataset: "extra_local_dataset",
+        origin: "local_secondary_dataset",
+        source_file: path.basename(filePath),
+        name,
+        factor,
+        unit: unit || "unité non précisée",
+        category: "dataset secondaire local",
+        source: path.basename(filePath),
+        status: "",
+        search_text: makeSearchText([name, unit, JSON.stringify(row)]),
+        raw: row
+      });
+    });
+
+    return records;
+  }
+
+  if (ext === ".xlsx" || ext === ".xls") {
+    const workbook = safeReadWorkbook(filePath);
+    if (!workbook) return [];
+
+    workbook.SheetNames.forEach((sheetName) => {
+      if (["notice", "readme", "infos", "environnement de calcul"].includes(normalize(sheetName))) return;
+
+      const sheet = workbook.Sheets[sheetName];
+      const rows = XLSX.utils.sheet_to_json(sheet, { defval: "" });
+
+      rows.forEach((row, index) => {
+        const name = chooseLikelyName(row);
+        const factor = chooseLikelyFactor(row);
+        const unit = chooseLikelyUnit(row);
+
+        if (!name || factor === null) return;
+
+        records.push({
+          id: `extra-${path.basename(filePath)}-${sheetName}-${index}`,
+          dataset: "extra_local_dataset",
+          origin: "local_secondary_dataset",
+          source_file: path.basename(filePath),
+          name,
+          factor,
+          unit: unit || "unité non précisée",
+          category: sheetName,
+          source: path.basename(filePath),
+          status: "",
+          search_text: makeSearchText([name, sheetName, unit, JSON.stringify(row)]),
+          raw: row
+        });
+      });
+    });
+
+    return records;
+  }
+
+  return [];
+}
+
 function loadLocalDatasets() {
-  const baseCarbone = loadBaseCarboneRecords();
-  const agribalyseProducts = loadAgribalyseProductsRecords();
-  const agribalyseAgriculture = loadAgribalyseAgricultureRecords();
+  const baseCarboneFile = resolveFirstExistingFile(DATA_DIR, BASE_CARBONE_CANDIDATES);
+  const agribalyseProductsFile = resolveFirstExistingFile(DATA_DIR, AGRIBALYSE_PRODUCTS_CANDIDATES);
+  const agribalyseAgriFile = resolveFirstExistingFile(DATA_DIR, AGRIBALYSE_AGRI_CANDIDATES);
+  const extraFiles = listExtraDatasetFiles(DATA_DIR);
+
+  const baseCarbone = loadBaseCarboneRecords(baseCarboneFile);
+  const agribalyseProducts = loadAgribalyseProductsRecords(agribalyseProductsFile);
+  const agribalyseAgriculture = loadAgribalyseAgricultureRecords(agribalyseAgriFile);
+  const extraLocal = extraFiles.flatMap((filePath) => loadGenericExtraRecords(filePath));
 
   return {
+    files: {
+      baseCarboneFile,
+      agribalyseProductsFile,
+      agribalyseAgriFile,
+      extraFiles
+    },
     baseCarbone,
     agribalyseProducts,
     agribalyseAgriculture,
-    all: [...baseCarbone, ...agribalyseProducts, ...agribalyseAgriculture]
+    extraLocal,
+    all: [...baseCarbone, ...agribalyseProducts, ...agribalyseAgriculture, ...extraLocal]
   };
 }
 
@@ -586,6 +767,7 @@ function extractLiveFactor(record) {
     id: record.recordid || `live-${normalize(name)}-${factor}`,
     dataset: "ademe_live",
     origin: "ademe_live",
+    source_file: "ADEME live",
     name,
     factor,
     unit,
@@ -602,23 +784,23 @@ function datasetPreferenceFromContext(context = {}) {
   const canonical = normalize(context.canonical || "");
   const original = normalize(context.original || "");
 
-  if (domain === "energy") return ["base_carbone", "ademe_live"];
-  if (domain === "transport") return ["base_carbone", "ademe_live"];
-  if (domain === "material") return ["base_carbone", "ademe_live"];
-  if (domain === "object") return ["base_carbone", "ademe_live"];
+  if (domain === "energy") return ["base_carbone", "ademe_live", "extra_local_dataset"];
+  if (domain === "transport") return ["base_carbone", "ademe_live", "extra_local_dataset"];
+  if (domain === "material") return ["base_carbone", "ademe_live", "extra_local_dataset"];
+  if (domain === "object") return ["base_carbone", "ademe_live", "extra_local_dataset"];
 
   const foodHints = ["aliment", "boisson", "yaourt", "lait", "viande", "fromage", "pomme", "banane", "salade"];
   const agriHints = ["ble", "mais", "vigne", "lait cru", "porc", "boeuf", "oeuf", "poulet", "quinoa"];
 
   if (foodHints.some((hint) => original.includes(hint) || canonical.includes(hint))) {
-    return ["agribalyse_products", "base_carbone", "ademe_live"];
+    return ["agribalyse_products", "base_carbone", "ademe_live", "extra_local_dataset"];
   }
 
   if (agriHints.some((hint) => original.includes(hint) || canonical.includes(hint))) {
-    return ["agribalyse_agriculture", "agribalyse_products", "base_carbone", "ademe_live"];
+    return ["agribalyse_agriculture", "agribalyse_products", "base_carbone", "ademe_live", "extra_local_dataset"];
   }
 
-  return ["base_carbone", "agribalyse_products", "agribalyse_agriculture", "ademe_live"];
+  return ["base_carbone", "agribalyse_products", "agribalyse_agriculture", "ademe_live", "extra_local_dataset"];
 }
 
 function scoreFactor(record, expectedUnit = "", context = {}) {
@@ -644,10 +826,11 @@ function scoreFactor(record, expectedUnit = "", context = {}) {
   if (canonical && category.includes(canonical)) score += 10;
   if (query && name.includes(query)) score += 8;
 
-  if (record.dataset === "base_carbone") score += 10;
+  if (record.dataset === "base_carbone") score += 12;
   if (record.dataset === "agribalyse_products") score += 10;
   if (record.dataset === "agribalyse_agriculture") score += 10;
   if (record.dataset === "ademe_live") score += 6;
+  if (record.dataset === "extra_local_dataset") score += 4;
 
   if (domain === "transport" && (name.includes("marchandise") || category.includes("transport"))) score += 10;
   if (domain === "energy" && (name.includes("electric") || name.includes("électric"))) score += 10;
@@ -664,6 +847,10 @@ function scoreFactor(record, expectedUnit = "", context = {}) {
     matchQuality = "exact";
   }
 
+  if (record.dataset === "extra_local_dataset" && matchQuality === "exact") {
+    matchQuality = "close";
+  }
+
   let grade = "E";
   if (score >= 90) grade = "A";
   else if (score >= 75) grade = "B";
@@ -678,9 +865,8 @@ function buildSelectionReason(selected, expectedUnit = "") {
   if (selected?.quality?.grade) reasons.push(`grade ${selected.quality.grade}`);
   if (selected?.dataset) reasons.push(`dataset ${selected.dataset}`);
   if (selected?.quality?.match_quality) reasons.push(`match ${selected.quality.match_quality}`);
-  if (expectedUnit && isLikelyUnitMatch(selected.unit || "", expectedUnit)) {
-    reasons.push(`unité alignée ${expectedUnit}`);
-  }
+  if (selected?.source_file) reasons.push(`fichier ${selected.source_file}`);
+  if (expectedUnit && isLikelyUnitMatch(selected.unit || "", expectedUnit)) reasons.push(`unité alignée ${expectedUnit}`);
   if (selected?.name) reasons.push(`libellé retenu: ${selected.name}`);
   return reasons.join(" | ");
 }
@@ -738,17 +924,7 @@ async function findBestFactor(queries, expectedUnit = "", context = {}) {
     };
 
     if (candidate.quality.score > existing.quality.score) {
-      merged.name = candidate.name;
-      merged.factor = candidate.factor;
-      merged.unit = candidate.unit;
-      merged.category = candidate.category;
-      merged.source = candidate.source;
-      merged.status = candidate.status;
-      merged.dataset = candidate.dataset;
-      merged.origin = candidate.origin;
-      merged.raw = candidate.raw;
-      merged.quality = candidate.quality;
-      merged.matched_query = candidate.matched_query;
+      Object.assign(merged, candidate);
     }
 
     dedupedMap.set(key, merged);
@@ -796,6 +972,7 @@ function provisionalMaterialFactor(material) {
     return {
       dataset: "provisional",
       origin: "provisional",
+      source_file: "none",
       name: "Estimation provisoire verre",
       factor: 0.85,
       unit: "kgCO2e/kg",
@@ -809,6 +986,7 @@ function provisionalMaterialFactor(material) {
     return {
       dataset: "provisional",
       origin: "provisional",
+      source_file: "none",
       name: "Estimation provisoire aluminium",
       factor: 8.6,
       unit: "kgCO2e/kg",
@@ -822,6 +1000,7 @@ function provisionalMaterialFactor(material) {
     return {
       dataset: "provisional",
       origin: "provisional",
+      source_file: "none",
       name: "Estimation provisoire bois",
       factor: 0.12,
       unit: "kgCO2e/kg",
@@ -841,6 +1020,7 @@ function provisionalTransportFactor(mode) {
     return {
       dataset: "provisional",
       origin: "provisional",
+      source_file: "none",
       name: "Estimation provisoire transport routier",
       factor: 0.12,
       unit: "kgCO2e/t.km",
@@ -1137,7 +1317,6 @@ server.tool(
         status: "OFFICIAL_FACTOR_NOT_FOUND",
         energy_type,
         consumption_kwh,
-        normalized_input: found.normalized_input,
         queries_tested: found.queries_tested,
         candidates_reviewed: found.candidates
       });
@@ -1182,9 +1361,9 @@ server.tool(
       followupQuestion: "Peux-tu préciser le produit alimentaire exact ?"
     });
 
-    const selected = found.selected?.dataset?.startsWith("agribalyse")
+    const selected = found.selected?.dataset === "agribalyse_products" || found.selected?.dataset === "agribalyse_agriculture"
       ? found.selected
-      : found.candidates.find((item) => item.dataset?.startsWith("agribalyse")) || null;
+      : found.candidates.find((item) => item.dataset === "agribalyse_products" || item.dataset === "agribalyse_agriculture") || null;
 
     if (!selected) {
       return mcpText({
@@ -1220,7 +1399,7 @@ server.tool(
 
 server.tool(
   "search_factor",
-  "Recherche brute dans les bases locales officielles et ADEME live",
+  "Recherche brute dans les bases locales et ADEME live",
   {
     query: z.string(),
     rows: z.number().optional()
@@ -1304,7 +1483,7 @@ server.tool(
 );
 
 app.get("/", (req, res) => {
-  res.send("MCP Carbone Hermes OK — v5.0.0");
+  res.send("MCP Carbone Hermes OK — v5.1.0");
 });
 
 app.get("/health", async (req, res) => {
@@ -1313,12 +1492,19 @@ app.get("/health", async (req, res) => {
   res.json({
     status: "OK",
     service: "mcp-carbone-hermes",
-    version: "5.0.0",
+    version: "5.1.0",
     dataset: DATASET,
+    files: {
+      base_carbone_file: LOCAL_DATASETS.files.baseCarboneFile ? path.basename(LOCAL_DATASETS.files.baseCarboneFile) : null,
+      agribalyse_products_file: LOCAL_DATASETS.files.agribalyseProductsFile ? path.basename(LOCAL_DATASETS.files.agribalyseProductsFile) : null,
+      agribalyse_agri_file: LOCAL_DATASETS.files.agribalyseAgriFile ? path.basename(LOCAL_DATASETS.files.agribalyseAgriFile) : null,
+      extra_files: LOCAL_DATASETS.files.extraFiles.map((f) => path.basename(f))
+    },
     local_datasets: {
       base_carbone: LOCAL_DATASETS.baseCarbone.length,
       agribalyse_products: LOCAL_DATASETS.agribalyseProducts.length,
       agribalyse_agriculture: LOCAL_DATASETS.agribalyseAgriculture.length,
+      extra_local: LOCAL_DATASETS.extraLocal.length,
       total: LOCAL_DATASETS.all.length
     },
     ademe_live: {
@@ -1333,10 +1519,14 @@ app.get("/reload-data", (req, res) => {
   LOCAL_DATASETS = loadLocalDatasets();
   res.json({
     status: "OK",
-    base_carbone: LOCAL_DATASETS.baseCarbone.length,
-    agribalyse_products: LOCAL_DATASETS.agribalyseProducts.length,
-    agribalyse_agriculture: LOCAL_DATASETS.agribalyseAgriculture.length,
-    total: LOCAL_DATASETS.all.length
+    files: LOCAL_DATASETS.files,
+    local_datasets: {
+      base_carbone: LOCAL_DATASETS.baseCarbone.length,
+      agribalyse_products: LOCAL_DATASETS.agribalyseProducts.length,
+      agribalyse_agriculture: LOCAL_DATASETS.agribalyseAgriculture.length,
+      extra_local: LOCAL_DATASETS.extraLocal.length,
+      total: LOCAL_DATASETS.all.length
+    }
   });
 });
 
@@ -1375,8 +1565,18 @@ app.post("/mcp", async (req, res) => {
 });
 
 app.listen(PORT, () => {
-  console.log(`MCP Carbone Hermes v5.0.0 running on port ${PORT}`);
-  console.log(`Base Carbone records: ${LOCAL_DATASETS.baseCarbone.length}`);
-  console.log(`Agribalyse products records: ${LOCAL_DATASETS.agribalyseProducts.length}`);
-  console.log(`Agribalyse agriculture records: ${LOCAL_DATASETS.agribalyseAgriculture.length}`);
+  console.log(`MCP Carbone Hermes v5.1.0 running on port ${PORT}`);
+  console.log("Loaded files:", {
+    baseCarboneFile: LOCAL_DATASETS.files.baseCarboneFile,
+    agribalyseProductsFile: LOCAL_DATASETS.files.agribalyseProductsFile,
+    agribalyseAgriFile: LOCAL_DATASETS.files.agribalyseAgriFile,
+    extraFiles: LOCAL_DATASETS.files.extraFiles
+  });
+  console.log("Dataset counts:", {
+    base_carbone: LOCAL_DATASETS.baseCarbone.length,
+    agribalyse_products: LOCAL_DATASETS.agribalyseProducts.length,
+    agribalyse_agriculture: LOCAL_DATASETS.agribalyseAgriculture.length,
+    extra_local: LOCAL_DATASETS.extraLocal.length,
+    total: LOCAL_DATASETS.all.length
+  });
 });
