@@ -356,7 +356,11 @@ function rowsToObjects(rows, headerIndex) {
 
 function safeReadWorkbook(filePath, options = {}) {
   if (!filePath || !fs.existsSync(filePath)) return null;
-  return XLSX.readFile(filePath, {
+
+  const buffer = fs.readFileSync(filePath);
+
+  return XLSX.read(buffer, {
+    type: "buffer",
     raw: false,
     cellDates: false,
     dense: true,
